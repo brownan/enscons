@@ -29,7 +29,9 @@ def urlsafe_b64encode(data):
 
 
 # Distribution names must match this
-DIST_NAME_RE = re.compile("^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$", flags=re.IGNORECASE)
+DIST_NAME_RE = re.compile(
+    "^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$", flags=re.IGNORECASE
+)
 
 # Extra names must match this
 EXTRA_RE = re.compile("^([a-z0-9]|[a-z0-9]([a-z0-9-](?!--))*[a-z0-9])$")
@@ -97,13 +99,17 @@ def _write_contacts(
         msg[header_email] = ", ".join(emails)
 
 
-def _generate_str_writer_action(s: str) -> Callable[[Sequence[Node], Sequence[Node], Environment], None]:
+def _generate_str_writer_action(
+    s: str,
+) -> Callable[[Sequence[Node], Sequence[Node], Environment], None]:
     """Returns an SCons action function which writes the given string to the target"""
+
     def action(target, source, env):
         target: File = target[0]
 
         with open(target.get_abspath(), "w") as f:
             f.write(s)
+
     return action
 
 
@@ -146,14 +152,14 @@ class Wheel:
 
         # Read in metadata
         toml = pytoml.load(open(self.pyproject.get_abspath()))
-        self.package_metadata = toml["project"]
+        self.project_metadata = toml["project"]
         try:
             self.tool_metadata = toml["tool"]["enscons"]
         except KeyError:
             self.tool_metadata = {}
 
         # Check the name is valid and normalize it
-        self.name = self.package_metadata["name"]
+        self.name = self.project_metadata["name"]
         if not DIST_NAME_RE.match(self.name):
             raise UserError(
                 "Distribution name must consist of only ASCII letters, numbers, period, "
@@ -161,11 +167,11 @@ class Wheel:
                 f"Was {self.name!r}"
             )
         self.normalized_filename = packaging.utils.canonicalize_name(
-            self.package_metadata["name"]
+            self.project_metadata["name"]
         ).replace("-", "_")
 
         # Check if the version is valid and normalize it
-        self.version = str(packaging.version.parse(self.package_metadata["version"]))
+        self.version = str(packaging.version.parse(self.project_metadata["version"]))
 
         wheel_filename = make_wheelname(
             self.normalized_filename,
@@ -180,26 +186,30 @@ class Wheel:
         metadata_targets = []
 
         metadata, metadata_sources = self._build_metadata()
-        metadata_targets.extend(env.Command(
-            self.wheel_data_dir.File("METADATA"),
-            metadata_sources,
-            _generate_str_writer_action(metadata),
-        ))
+        metadata_targets.extend(
+            env.Command(
+                self.wheel_data_dir.File("METADATA"),
+                metadata_sources,
+                _generate_str_writer_action(metadata),
+            )
+        )
 
         wheel_metadata, wheel_metadata_sources = self._build_wheel_metadata()
-        metadata_targets.extend(env.Command(
-            self.wheel_data_dir.File("WHEEL"),
-            wheel_metadata_sources,
-            _generate_str_writer_action(wheel_metadata),
-        ))
+        metadata_targets.extend(
+            env.Command(
+                self.wheel_data_dir.File("WHEEL"),
+                wheel_metadata_sources,
+                _generate_str_writer_action(wheel_metadata),
+            )
+        )
 
         self._zip_env = env.Clone(ZIPROOT=self.wheel_build_dir)
-        self.target = self._add_zip_source(metadata_targets)
+        self.target = self._add_zip_sources(metadata_targets)
 
         env.AddPostAction(self.target, env.Action(self._add_manifest))
         env.Clean(self.target, self.build_dir)
 
-    def _add_zip_source(self, sources):
+    def _add_zip_sources(self, sources):
         return self._zip_env.Zip(
             self.wheel_file,
             sources,
@@ -208,37 +218,38 @@ class Wheel:
     def add_sources(self, sources, root="."):
         """Add sources to the wheel using the given root directory as the relative path root
 
-        The root parameter contruls how to map paths on the filesystem to paths in the wheel.
+        The root parameter controls how to map paths on the filesystem to paths in the wheel.
         For example:
             wheel.add_sources("src/packagename/modulename.py", "src")
-        will zip the file into the weel at "packagename/modulename.py.
+        will zip the file into the wheel at "packagename/modulename.py.
 
-        Similarly, if your packages or moudles are in the top level directory of your
+        Similarly, if your packages or modules are in the top level directory of your
         repository (same directory as the SConstruct file):
             wheel.add_sources("packagename/modulename.py", ".")
         will add that file into the same place in the zip.
 
         For generated files, such as compiled extension modules, they are expected to
-        live under one of the directories in ./build/. The root directory is then itself
-        relative to the build subdirectory.
+        live under one of the directories in ./build/, e.g. build/lib.linux-x86_64/modulename.so
 
         For example, these examples will add the extension module to the same place in the wheel:
-            wheel.add_sources("build/lib.linux-x86_64/myextmodule.so", ".")
-            wheel.add_sources("build/lib.linux-x86_64/src/myextmodule.so", "src")
+            wheel.add_sources("build/lib.linux-x86_64/modulename.so", ".")
+            wheel.add_sources("build/lib.linux-x86_64/src/modulename.so", "src")
         Both get added to the root of the wheel.
 
-        More formally, the root is relative to the best match of either a subdirectory
-        of build (i.e. ./build/*/) or the root of the environment (defined by the top level
-        SConstruct file)
+        More formally, the specified root is relative to the first match of:
+        A) One of the subdirectories under build/
+        B) The top level directory (next to the SConstruct file)
+
+        All directories between the root and the source file are preserved in the wheel file.
 
         """
         sources = self.env.arg2nodes(sources, self.env.Entry)
 
-        source:  Entry
+        source: Entry
         for source in self.env.arg2nodes(sources, self.env.Entry):
             path_componets = source.get_path_elements()
             # Find which root directory this source is under
-            for name, d in self.wheel_build_dir.entries.items():
+            for d in self.wheel_build_dir.entries.values():
                 if d.isdir() and d in path_componets:
                     break
             else:
@@ -249,15 +260,17 @@ class Wheel:
             abs_source_path: str = source.get_abspath()
             abs_root_path: str = root.get_abspath()
             if not abs_source_path.startswith(abs_root_path):
-                raise UserError(f"Cannot add source at {abs_source_path}. "
-                                f"File is outside any known root directories")
+                raise UserError(
+                    f"Cannot add source at {abs_source_path}. "
+                    f"File is outside any known root directories"
+                )
 
             # Now compute the relative path from root to source
             rel_path = os.path.relpath(abs_source_path, abs_root_path)
 
             target_dir = self.wheel_build_dir.Dir(os.path.dirname(rel_path))
             targets = self.env.Install(target_dir, source)
-            self._add_zip_source(targets)
+            self._add_zip_sources(targets)
 
     def add_data(self, category, sources, root=None):
         """Add sources to the data directory called "category", relative to the given root"""
@@ -265,7 +278,7 @@ class Wheel:
             rel_path = os.path.relpath(source.get_path(), root or "")
             whl_path = self.wheel_data_dir.Dir(category).Dir(rel_path)
             targets = self.env.Install(whl_path, source)
-            self._add_zip_source(targets)
+            self._add_zip_sources(targets)
 
     def _add_manifest(self, target, source, env):
         archive = zipfile.ZipFile(
@@ -290,7 +303,7 @@ class Wheel:
         # Reference: https://packaging.python.org/en/latest/specifications/core-metadata/
         sources: List[Node] = [self.pyproject]
         msg = Message()
-        metadata = self.package_metadata
+        metadata = self.project_metadata
 
         # Required metadata
         msg["Metadata-Version"] = "2.3"
@@ -298,14 +311,10 @@ class Wheel:
         msg["Version"] = self.version
 
         # Optional metadata
-        # Simple values map directly from pyproject.toml keys to core metadata fiels
-        toml_to_core = [
-            ("description", "Summary"),
-            ("requires-python", "Requires-Python"),
-        ]
-        for toml_key, core_field in toml_to_core:
-            if toml_key in metadata:
-                msg[core_field] = metadata[toml_key]
+        if "description" in metadata:
+            msg["Summary"] = metadata["description"]
+        if "requires-python" in metadata:
+            msg["Requires-Python"] = metadata["requires-python"]
 
         # Readme field. May be a string referencing a file, or a table specifying a content
         # type and either a file or text.
@@ -355,6 +364,12 @@ class Wheel:
             msg["Description-Content-Type"] = contenttype
             msg.set_payload(content)
 
+        # License must be a table with either a "text" or a "file" key. Either the text
+        # string or the file's contents are added under the License core metadata field.
+        # If I'm interpreting the spec right, the entire license is stuffed into this single
+        # field. I wonder if the spec intended to e.g. include the entire GPL here?
+        # I think the intent was to only use this field if the license is something
+        # non-standard. Otherwise, use the appropriate classifier.
         if "license" in metadata:
             filename = metadata["license"].get("file")
             content = metadata["license"].get("text")
