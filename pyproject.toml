@@ -18,7 +18,7 @@ dependencies = [
   "editables==0.2;python_version>'3.0'",
 ]
 keywords = ["packaging", "wheel"]
-license = "MIT"
+license = {text= "MIT"}
 packages = ["enscons"]
 readme = "README.rst"
 src_root = "."
