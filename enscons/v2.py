@@ -4,23 +4,21 @@ import os
 import re
 import sys
 import sysconfig
-import time
 import zipfile
 from email.message import Message
-from typing import TYPE_CHECKING, Union, Optional, List, Sequence, Tuple, Callable
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
+import packaging.requirements
 import packaging.tags
 import packaging.utils
 import packaging.version
-import packaging.requirements
 import pytoml
 from SCons.Environment import Environment
 from SCons.Errors import UserError
 from SCons.Node import Node
-from SCons.Node.Python import Value
 
 if TYPE_CHECKING:
-    from SCons.Node.FS import File, Dir, Entry
+    from SCons.Node.FS import Dir, Entry, File
 
 
 def urlsafe_b64encode(data):
@@ -35,82 +33,6 @@ DIST_NAME_RE = re.compile(
 
 # Extra names must match this
 EXTRA_RE = re.compile("^([a-z0-9]|[a-z0-9]([a-z0-9-](?!--))*[a-z0-9])$")
-
-
-def exists(env):
-    return True
-
-
-def get_rel_dir(source: Union["File", str], root: Union["Dir", str]):
-    """Returns the directory the given source file is in, relative to the given root
-
-    This is useful for computing the whl_path of a file for later inclusion in a wheel
-    via Wheel.add_sources()
-    """
-    source = os.path.abspath(str(source))
-    root = os.path.abspath(str(root))
-    if not source.startswith(root):
-        raise ValueError(f"Source path {source} is not within root {root}")
-
-    relfile = os.path.relpath(source, root)
-    relpath = os.path.dirname(relfile)
-    return relpath
-
-
-def make_wheelname(dist_name, version, wheel_tag, build_tag=None):
-    """Returns the wheel name for the given distribution name, version, wheel tag,
-    and optional build tag.
-
-    This implements the naming convention described at
-    https://packaging.python.org/en/latest/specifications/binary-distribution-format/#file-name-convention
-    """
-    if build_tag:
-        template = "{distribution}-{version}-{build_tag}-{wheel_tag}.whl"
-    else:
-        template = "{distribution}-{version}-{wheel_tag}.whl"
-    return template.format(
-        distribution=dist_name, version=version, wheel_tag=wheel_tag, build_tag=build_tag
-    )
-
-
-def _write_contacts(
-    msg: Message, header_name: str, header_email: str, contacts: List[dict]
-):
-    # Reference https://packaging.python.org/en/latest/specifications/declaring-project-metadata/#authors-maintainers
-    names = []
-    emails = []
-    for contact in contacts:
-        name = contact.get("name")
-        email = contact.get("email")
-        if not name and not email:
-            raise UserError(
-                f'At least one of "name" or "email" must be specified for each author and maintainer'
-            )
-        elif name and not email:
-            names.append(name)
-        elif email and not name:
-            emails.append(email)
-        else:
-            emails.append(f"{name} <{email}>")
-
-    if names:
-        msg[header_name] = ", ".join(names)
-    if emails:
-        msg[header_email] = ", ".join(emails)
-
-
-def _generate_str_writer_action(
-    s: str,
-) -> Callable[[Sequence[Node], Sequence[Node], Environment], None]:
-    """Returns an SCons action function which writes the given string to the target"""
-
-    def action(target, source, env):
-        target: File = target[0]
-
-        with open(target.get_abspath(), "w") as f:
-            f.write(s)
-
-    return action
 
 
 class Wheel:
@@ -433,15 +355,76 @@ class Wheel:
 
 def SDist(env: Environment, sources):
     sources = env.arg2nodes(sources, env.Entry)
+    # TODO
 
 
 def Editable(env, src_root="."):
     """Returns a wheel built for installing an editable path"""
     root = env.Dir(src_root)
-    raise NotImplementedError
+    raise NotImplementedError  # TODO
+
+
+def make_wheelname(dist_name, version, wheel_tag, build_tag=None):
+    """Returns the wheel name for the given distribution name, version, wheel tag,
+    and optional build tag.
+
+    This implements the naming convention described at
+    https://packaging.python.org/en/latest/specifications/binary-distribution-format/#file-name-convention
+    """
+    if build_tag:
+        template = "{distribution}-{version}-{build_tag}-{wheel_tag}.whl"
+    else:
+        template = "{distribution}-{version}-{wheel_tag}.whl"
+    return template.format(
+        distribution=dist_name, version=version, wheel_tag=wheel_tag, build_tag=build_tag
+    )
+
+
+def _write_contacts(
+    msg: Message, header_name: str, header_email: str, contacts: List[dict]
+):
+    # Reference https://packaging.python.org/en/latest/specifications/declaring-project-metadata/#authors-maintainers
+    names = []
+    emails = []
+    for contact in contacts:
+        name = contact.get("name")
+        email = contact.get("email")
+        if not name and not email:
+            raise UserError(
+                f'At least one of "name" or "email" must be specified for each author and maintainer'
+            )
+        elif name and not email:
+            names.append(name)
+        elif email and not name:
+            emails.append(email)
+        else:
+            emails.append(f"{name} <{email}>")
+
+    if names:
+        msg[header_name] = ", ".join(names)
+    if emails:
+        msg[header_email] = ", ".join(emails)
+
+
+def _generate_str_writer_action(
+    s: str,
+) -> Callable[[Sequence[Node], Sequence[Node], Environment], None]:
+    """Returns an SCons action function which writes the given string to the target"""
+
+    def action(target, source, env):
+        target: File = target[0]
+
+        with open(target.get_abspath(), "w") as f:
+            f.write(s)
+
+    return action
 
 
 def generate(env: Environment, **kwargs):
     env.AddMethod(Wheel)
     env.AddMethod(SDist)
     env.AddMethod(Editable)
+
+
+def exists(env):
+    return True
