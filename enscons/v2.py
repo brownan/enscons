@@ -317,8 +317,6 @@ class Wheel:
         # Env configuration
         self.wheel_output_dir = env.Dir(env.get("WHEEL_DIR"))
 
-        platform_specifier = f"{sysconfig.get_platform()}-{sys.implementation.cache_tag}"
-
         # Read in previously parsed metadata
         self.pyproject: PyProject = env["PYPROJECT"]
         self.project_metadata = self.pyproject.project_metadata
@@ -329,8 +327,6 @@ class Wheel:
 
         # Derived configuration: temporary build directories
         self.wheel_build_dir: Dir = self.build_dir.Dir("wheel")
-        self.build_temp_dir: Dir = self.build_dir.Dir(f"temp.{platform_specifier}")
-        self.build_lib_dir: Dir = self.build_dir.Dir(f"lib.{platform_specifier}")
         self.wheel_data_dir: Dir = _wheel_data_dir(self.wheel_build_dir, self.pyproject)
 
         wheel_filename = _make_wheelname(

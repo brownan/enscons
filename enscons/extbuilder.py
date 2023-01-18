@@ -4,10 +4,15 @@ import sysconfig
 import os.path
 import sys
 from pathlib import Path
-from typing import Sequence, Optional
+from typing import Sequence, Optional, TYPE_CHECKING
 
 from SCons.Node.FS import File
 
+from enscons.v2 import get_build_path, get_rel_path
+
+if TYPE_CHECKING:
+    from SCons.Node.FS import Dir, Entry, File
+    from SCons.Node import Node
 
 def configure_compiler_env(env):
     # Get various compiler options we need to build a python extension module
@@ -67,12 +72,14 @@ def ExtModule(
     env,
     modsource: File,
     extra_sources: Optional[Sequence[File]] = None,
-    root: Optional[str] = None,
 ):
     """Compiles and adds an extension module to a wheel"""
-    root = root or env["PY_SOURCE_ROOT"]
     env = env.Clone()
     configure_compiler_env(env)
+
+    platform_specifier = f"{sysconfig.get_platform()}-{sys.implementation.cache_tag}"
+    build_dir: "Dir" = env["WHEEL_BUILD_DIR"].Dir(f"temp.{platform_specifier}")
+    lib_dir: "Dir" = env["WHEEL_BUILD_DIR"].Dir(f"lib.{platform_specifier}")
 
     modsource = env.arg2nodes(modsource, env.File)[0]
 
@@ -83,51 +90,29 @@ def ExtModule(
 
     objects = []
     for node in source_files:
-        obj_file_name = os.path.relpath(node.get_path(), root)
-        target = Path(env["PY_TEMP_DIR"], obj_file_name).with_suffix("")
-        objects.append(env.SharedObject(target=str(target), source=node))
+        obj = Path(get_build_path(env, node, build_dir).get_path()).with_suffix("")
+        objects.append(env.SharedObject(target=str(obj), source=node))
 
-    relpath = os.path.dirname(os.path.relpath(modsource.get_path(), root))
-    module_name = Path(modsource.get_path()).stem
-    module_target = os.path.join(env["PY_LIB_DIR"], relpath, module_name)
-    library = env.SharedLibrary(target=str(module_target), source=objects)
+    so = Path(get_build_path(env, modsource, lib_dir).get_path()).with_suffix("")
+    library = env.SharedLibrary(target=str(so), source=objects)
+
     return library
 
 
 def InstallExtensionInplace(
     env,
     ext_module: File,
-    root: Optional[str] = None,
 ):
-    ext_module = env.arg2nodes(ext_module, env.File)[0]
-    root = root or env["PY_SOURCE_ROOT"]
-    relpath = os.path.dirname(os.path.relpath(ext_module.get_path(), env["PY_LIB_DIR"]))
-    directory = os.path.join(root, relpath)
-
-    return env.Install(directory, ext_module)
-
-
-def WhlExtension(
-    env,
-    ext_module: File,
-):
-    ext_module = env.arg2nodes(ext_module, env.File)[0]
-    relpath = os.path.dirname(os.path.relpath(ext_module.get_path(), env["PY_LIB_DIR"]))
-
-    directory = env["WHEEL_PATH"].Dir(relpath)
-    return env.Install(directory, ext_module)
+    targets = []
+    ext_modules = env.arg2nodes(ext_module, env.File)
+    for module in ext_modules:
+        relpath = get_rel_path(env, module)
+        targets.extend(env.InstallAs(relpath, module))
+    return targets
 
 def generate(env, **kwargs):
     env.AddMethod(ExtModule)
-    env.AddMethod(WhlExtension)
     env.AddMethod(InstallExtensionInplace)
-
-    # Add some construction env vars that shouldn't affect non-python compilations
-    # Set build paths for objects and shared libraries
-    plat_name = sysconfig.get_platform()
-    plat_specifier = f".{plat_name}-{sys.implementation.cache_tag}"
-    env["PY_TEMP_DIR"] = f"build/temp{plat_specifier}"
-    env["PY_LIB_DIR"] = f"build/lib{plat_specifier}"
 
 
 def exists(env):
