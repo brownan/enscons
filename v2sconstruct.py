@@ -8,8 +8,10 @@ env = Environment(
     tools=["default", "packaging", enscons.v2.generate]
 )
 
+tag = "py38-none-any"
+
 wheel = env.Wheel(
-    tag="py38-none-any",
+    tag
 )
 wheel.add_sources("enscons/v2.py", ".")
 env.Alias("bdist_wheel", wheel.target)
@@ -21,7 +23,5 @@ sdist = env.SDist([
 ])
 env.Alias("sdist", sdist)
 
-output_value = env.Textfile(
-    env.File(env.get_build_path("txtfile.txt", "foo")),
-    "Text file contents")
-env.Alias("txt", output_value)
+editable = env.Editable(tag)
+env.Alias("editable", editable)

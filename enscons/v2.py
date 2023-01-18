@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -8,7 +9,16 @@ import sysconfig
 import zipfile
 from configparser import ConfigParser
 from email.message import Message
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple, Union, NamedTuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    NamedTuple,
+)
 
 import packaging.requirements
 import packaging.tags
@@ -123,7 +133,9 @@ class PyProject(NamedTuple):
     # The filename that it was parsed from
     file: str
 
-def parse_pyproject_toml(file: str):
+
+def parse_pyproject_toml(file: str) -> PyProject:
+    """Reads in a pyproject.toml file, does some minimal normalization and validation"""
     toml = pytoml.load(open(file))
     project_metadata = toml["project"]
     try:
@@ -139,12 +151,9 @@ def parse_pyproject_toml(file: str):
             "underscore, and hyphen. It must start and end with a letter or number. "
             f"Was {name!r}"
         )
-    project_metadata["name"] = name
 
     # The distribution name component to be used in filenames
-    dist_filename = packaging.utils.canonicalize_name(
-        name
-    ).replace("-", "_")
+    dist_filename = packaging.utils.canonicalize_name(name).replace("-", "_")
 
     # Check if the version is valid and normalize it
     version = str(packaging.version.parse(project_metadata["version"]))
@@ -159,11 +168,11 @@ def parse_pyproject_toml(file: str):
         file=file,
     )
 
-def build_core_metadata(pyproject: PyProject) -> Tuple[str, List["File"]]:
-    """Builds the core metadata from the parsed pyproject.toml data
 
-    """
+def build_core_metadata(pyproject: PyProject) -> Tuple[str, List[str]]:
+    """Builds the core metadata from the parsed pyproject.toml data"""
     # Reference: https://packaging.python.org/en/latest/specifications/core-metadata/
+    # and: https://packaging.python.org/en/latest/specifications/declaring-project-metadata/
     sources: List[str] = [pyproject.file]
     msg = Message()
     metadata = pyproject.project_metadata
@@ -191,7 +200,8 @@ def build_core_metadata(pyproject: PyProject) -> Tuple[str, List["File"]]:
             assert isinstance(readme, dict)
             if "file" and "text" in readme:
                 raise UserError(
-                    f'"file" and "text" keys are mutually exclusive in {pyproject.file} project.readme table'
+                    f'"file" and "text" keys are mutually exclusive in {pyproject.file}'
+                    f' project.readme table'
                 )
             if "file" in readme:
                 filename = readme["file"]
@@ -248,9 +258,7 @@ def build_core_metadata(pyproject: PyProject) -> Tuple[str, List["File"]]:
     if "authors" in metadata:
         _write_contacts(msg, "Author", "Author-Email", metadata["authors"])
     if "maintainers" in metadata:
-        _write_contacts(
-            msg, "Maintainer", "Maintainer-Email", metadata["maintainers"]
-        )
+        _write_contacts(msg, "Maintainer", "Maintainer-Email", metadata["maintainers"])
 
     if "keywords" in metadata:
         msg["Keywords"] = ",".join(metadata["keywords"])
@@ -311,11 +319,6 @@ class Wheel:
 
         platform_specifier = f"{sysconfig.get_platform()}-{sys.implementation.cache_tag}"
 
-        # Derived configuration: temporary build directories
-        self.wheel_build_dir: Dir = self.build_dir.Dir("wheel")
-        self.build_temp_dir: Dir = self.build_dir.Dir(f"temp.{platform_specifier}")
-        self.build_lib_dir: Dir = self.build_dir.Dir(f"lib.{platform_specifier}")
-
         # Read in previously parsed metadata
         self.pyproject: PyProject = env["PYPROJECT"]
         self.project_metadata = self.pyproject.project_metadata
@@ -324,51 +327,30 @@ class Wheel:
         self.normalized_filename = self.pyproject.dist_filename
         self.version = self.pyproject.version
 
-        wheel_filename = make_wheelname(
+        # Derived configuration: temporary build directories
+        self.wheel_build_dir: Dir = self.build_dir.Dir("wheel")
+        self.build_temp_dir: Dir = self.build_dir.Dir(f"temp.{platform_specifier}")
+        self.build_lib_dir: Dir = self.build_dir.Dir(f"lib.{platform_specifier}")
+        self.wheel_data_dir: Dir = _wheel_data_dir(self.wheel_build_dir, self.pyproject)
+
+        wheel_filename = _make_wheelname(
             self.normalized_filename,
             self.version,
             self.tag,
         )
         self.wheel_file = self.wheel_output_dir.File(wheel_filename)
 
-        data_dir_name = f"{self.normalized_filename}-{self.version}.dist-info"
-        self.wheel_data_dir = self.wheel_build_dir.Dir(data_dir_name)
-
-        metadata_targets = []
-
-        # Metadata and wheel metadata are built at construction time because we don't know
-        # which sources to pass to SCons for dependency tracking until after the metadata
-        # is read and parsed.
-        metadata, metadata_sources = env["CORE_METADATA"], env["CORE_METADATA_SOURCES"]
-        metadata_targets.extend(
-            env.Command(
-                self.wheel_data_dir.File("METADATA"),
-                metadata_sources,
-                _generate_str_writer_action(metadata),
-            )
-        )
-
-        wheel_metadata, wheel_metadata_sources = self._get_wheel_metadata()
-        metadata_targets.extend(
-            env.Command(
-                self.wheel_data_dir.File("WHEEL"),
-                wheel_metadata_sources,
-                _generate_str_writer_action(wheel_metadata),
-            )
-        )
-
-        metadata_targets.append(
-            env.Command(
-                self.wheel_data_dir.File("entry_points.txt"),
-                self.pyproject.file,
-                self._build_entry_points,
-            )
+        metadata_targets = _build_wheel_metadata_dir(
+            env,
+            self.wheel_build_dir,
+            tag,
+            build_num=build_num,
         )
 
         self._zip_env = env.Clone(ZIPROOT=self.wheel_build_dir)
         self.target = self._add_zip_sources(metadata_targets)
 
-        env.AddPostAction(self.target, env.Action(self._add_manifest))
+        env.AddPostAction(self.target, _add_manifest)
         env.Clean(self.target, self.wheel_build_dir)
 
     def _add_zip_sources(self, sources):
@@ -424,72 +406,6 @@ class Wheel:
             targets = self.env.InstallAs(install_path, source)
             self._add_zip_sources(targets)
 
-    def _add_manifest(self, target, source, env):
-        # Called after the zip file has been written to the filesystem.
-        archive = zipfile.ZipFile(
-            target[0].get_path(), "a", compression=zipfile.ZIP_DEFLATED
-        )
-        lines = []
-        for f in archive.namelist():
-            data = archive.read(f)
-            size = len(data)
-            digest = hashlib.sha256(data).digest()
-            digest = "sha256=" + (urlsafe_b64encode(digest).decode("ascii"))
-            lines.append("%s,%s,%s" % (f.replace(",", ",,"), digest, size))
-
-        record_path = os.path.join(self.wheel_data_dir.name, "RECORD")
-        lines.append(record_path + ",,")
-        RECORD = "\n".join(lines)
-        with archive.open(record_path, "w") as f:
-            f.write(RECORD.encode("utf-8"))
-        archive.close()
-
-    def _get_wheel_metadata(self) -> Tuple[str, Sequence[Union[str, "Node"]]]:
-        msg = Message()
-        msg["Wheel-Version"] = "1.0"
-        msg["Generator"] = "enscons"
-        msg["Root-Is-Purelib"] = str(self.root_is_purelib).lower()
-        if self.build_num is not None:
-            msg["Build"] = self.build_num
-        for tag in self.tags:
-            msg["Tag"] = str(tag)
-
-        sources = [self.pyproject.file]
-        if self.build_num is not None:
-            sources.append(self.env.Value(f"Build: {self.build_num}"))
-
-        return str(msg), sources
-
-    def _build_entry_points(self, target, source, env):
-        metadata = self.project_metadata
-
-        groups = {}
-
-        if "scripts" in metadata:
-            groups["console_scripts"] = metadata["scripts"]
-
-        if "gui-scripts" in metadata:
-            groups["gui_scripts"] = metadata["gui-scripts"]
-
-        if "entry-points" in metadata:
-            for group, items in metadata["entry-points"].items():
-                if group in ("scripts", "gui-scripts"):
-                    raise UserError(
-                        f"Invalid {self.pyproject} table "
-                        f"project.entry-points.{group} Use project.{group} "
-                        f"instead"
-                    )
-                groups[group] = items
-
-        ini = ConfigParser()
-        for group, items in groups.items():
-            ini.add_section(group)
-            for key, val in items.items():
-                ini[group][key] = val
-
-        with open(target[0].get_abspath(), "w", encoding="utf-8") as f:
-            ini.write(f)
-
 
 def SDist(env: Environment, sources) -> List["Entry"]:
     sources = env.arg2nodes(sources, env.Entry)
@@ -506,10 +422,12 @@ def SDist(env: Environment, sources) -> List["Entry"]:
         )
     ]
     for source in sources:
-        targets.extend(env.InstallAs(
-            get_build_path(env, source, build_dir),
-            source,
-        ))
+        targets.extend(
+            env.InstallAs(
+                get_build_path(env, source, build_dir),
+                source,
+            )
+        )
 
     pyproject: PyProject = env["PYPROJECT"]
     dirname = f"{pyproject.dist_filename}-{pyproject.version}"
@@ -524,19 +442,128 @@ def SDist(env: Environment, sources) -> List["Entry"]:
     return target
 
 
-def Editable(env, src_root="."):
-    """Returns a wheel built for installing an editable path"""
-    root = env.Dir(src_root)
-    raise NotImplementedError  # TODO
+def Editable(env, tag: str, src_root="."):
+    """Returns a wheel built for installing an editable path
 
-
-def make_wheelname(dist_name, version, wheel_tag, build_tag=None):
-    """Returns the wheel name for the given distribution name, version, wheel tag,
-    and optional build tag.
-
-    This implements the naming convention described at
-    https://packaging.python.org/en/latest/specifications/binary-distribution-format/#file-name-convention
+    See PEP 662
+    https://peps.python.org/pep-0662/
     """
+    roots = env.arg2nodes(src_root, env.Dir)
+    pyproject: PyProject = env["PYPROJECT"]
+
+    # Build the editable json structure
+    editable = {
+        "version": 1,
+        "scheme": {
+            "purelib": {},
+            "platlib": {},
+            "data": {},
+            "headers": {},
+            "scripts": {},
+        },
+    }
+
+    path_map = {source.get_abspath(): "" for source in roots}
+
+    if tag.endswith("-none-any"):
+        editable["scheme"]["purelib"] = path_map
+    else:
+        editable["scheme"]["platlib"] = path_map
+
+    target_dir = env["WHEEL_DIR"]
+    build_dir = env["WHEEL_BUILD_DIR"].Dir("editable")
+
+    wheel_filename = _make_wheelname(
+        pyproject.dist_filename,
+        pyproject.version,
+        tag,
+        "editable",
+    )
+
+    editable_file = env.Command(
+        build_dir.File("editable.json"),
+        pyproject.file,
+        _generate_str_writer_action(json.dumps(editable, indent=4)),
+    )
+
+    wheel_metadata = _build_wheel_metadata_dir(
+        env,
+        build_dir,
+        tag,
+        editable=True,
+    )
+
+    target = env.Zip(
+        target_dir.File(wheel_filename),
+        [editable_file] + wheel_metadata,
+        ZIPROOT=build_dir,
+    )
+    env.AddPostAction(target, _add_manifest)
+    env.Clean(target, build_dir)
+    return target
+
+
+def _build_wheel_metadata_dir(
+    env: Environment,
+    target: "Dir",
+    tag: str,
+    build_num: Optional[int] = None,
+    editable: bool = False,
+) -> List["Entry"]:
+    """Builds a wheel metadata directory in the given target directory"""
+    pyproject: PyProject = env["PYPROJECT"]
+    root_is_purelib = tag.endswith("-none-any")
+    wheel_data_dir = _wheel_data_dir(target, pyproject)
+
+    output_targets = []
+
+    # Metadata and wheel metadata are built at construction time because we don't know
+    # which sources to pass to SCons for dependency tracking until after the metadata
+    # is read and parsed.
+    output_targets.extend(
+        env.Command(
+            wheel_data_dir.File("METADATA"),
+            env["CORE_METADATA_SOURCES"],
+            _generate_str_writer_action(env["CORE_METADATA"]),
+        )
+    )
+
+    # Build wheel metadata
+    msg = Message()
+    msg["Wheel-Version"] = "1.0"
+    msg["Generator"] = "enscons"
+    msg["Root-Is-Purelib"] = str(root_is_purelib).lower()
+    if build_num is not None:
+        msg["Build"] = build_num
+    for tag in packaging.tags.parse_tag(tag):
+        msg["Tag"] = str(tag)
+    if editable:
+        msg["Editable"] = "true"
+
+    output_targets.extend(
+        env.Command(
+            wheel_data_dir.File("WHEEL"),
+            [pyproject.file],
+            _generate_str_writer_action(str(msg)),
+        )
+    )
+
+    output_targets.extend(
+        env.Command(
+            wheel_data_dir.File("entry_points.txt"), [pyproject.file], _build_entry_points
+        )
+    )
+    return output_targets
+
+
+def _wheel_data_dir(build_dir: "Dir", pyproject: PyProject):
+    data_dir_name = f"{pyproject.dist_filename}-{pyproject.version}.dist-info"
+    wheel_data_dir = build_dir.Dir(data_dir_name)
+    return wheel_data_dir
+
+
+def _make_wheelname(dist_name, version, wheel_tag, build_tag=None):
+    # Reference https://packaging.python.org/en/latest/specifications/binary-distribution-format/#file-name-convention
     if build_tag:
         template = "{distribution}-{version}-{build_tag}-{wheel_tag}.whl"
     else:
@@ -586,6 +613,60 @@ def _generate_str_writer_action(
     return action
 
 
+def _build_entry_points(target, source, env):
+    """Builder action for the entry points file"""
+    pyproject: PyProject = env["PYPROJECT"]
+    metadata = pyproject.project_metadata
+
+    groups = {}
+
+    if "scripts" in metadata:
+        groups["console_scripts"] = metadata["scripts"]
+
+    if "gui-scripts" in metadata:
+        groups["gui_scripts"] = metadata["gui-scripts"]
+
+    if "entry-points" in metadata:
+        for group, items in metadata["entry-points"].items():
+            if group in ("scripts", "gui-scripts"):
+                raise UserError(
+                    f"Invalid {pyproject.file} table "
+                    f"project.entry-points.{group} Use project.{group} "
+                    f"instead"
+                )
+            groups[group] = items
+
+    ini = ConfigParser()
+    for group, items in groups.items():
+        ini.add_section(group)
+        for key, val in items.items():
+            ini[group][key] = val
+
+    with open(target[0].get_abspath(), "w", encoding="utf-8") as f:
+        ini.write(f)
+
+
+def _add_manifest(target, source, env):
+    # Called after the wheel file has been written to the filesystem.
+    pyproject: PyProject = env["PYPROJECT"]
+    data_dir_name = f"{pyproject.dist_filename}-{pyproject.version}.dist-info"
+    archive = zipfile.ZipFile(target[0].get_path(), "a", compression=zipfile.ZIP_DEFLATED)
+    lines = []
+    for f in archive.namelist():
+        data = archive.read(f)
+        size = len(data)
+        digest = hashlib.sha256(data).digest()
+        digest = "sha256=" + (urlsafe_b64encode(digest).decode("ascii"))
+        lines.append("%s,%s,%s" % (f.replace(",", ",,"), digest, size))
+
+    record_path = os.path.join(data_dir_name, "RECORD")
+    lines.append(record_path + ",,")
+    RECORD = "\n".join(lines)
+    with archive.open(record_path, "w") as f:
+        f.write(RECORD.encode("utf-8"))
+    archive.close()
+
+
 def generate(env: Environment, **kwargs):
     pytar.generate(env)
     if "WHEEL_BUILD_DIR" not in env:
@@ -599,7 +680,9 @@ def generate(env: Environment, **kwargs):
 
     pyproject_file = env.get("PYPROJECT_FILE", "pyproject.toml")
     env["PYPROJECT"] = parse_pyproject_toml(pyproject_file)
-    env["CORE_METADATA"], env["CORE_METADATA_SOURCES"] = build_core_metadata(env["PYPROJECT"])
+    env["CORE_METADATA"], env["CORE_METADATA_SOURCES"] = build_core_metadata(
+        env["PYPROJECT"]
+    )
 
     env.AddMethod(get_rel_path)
     env.AddMethod(get_build_path)
