@@ -1,13 +1,14 @@
 import base64
 import hashlib
 import os
+import pathlib
 import re
 import sys
 import sysconfig
 import zipfile
 from configparser import ConfigParser
 from email.message import Message
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple, Union, NamedTuple
 
 import packaging.requirements
 import packaging.tags
@@ -16,10 +17,12 @@ import packaging.version
 import pytoml
 from SCons.Environment import Environment
 from SCons.Errors import UserError
-from SCons.Node import Node
+
+from enscons import pytar
 
 if TYPE_CHECKING:
     from SCons.Node.FS import Dir, Entry, File
+    from SCons.Node import Node
 
 
 def urlsafe_b64encode(data):
@@ -35,6 +38,250 @@ EPOINT_GROUP_RE = re.compile(r"^\w+(\.\w+)*$")
 EPOINT_NAME_RE = re.compile(r"[\w.-]+")
 
 
+def get_rel_path(env: Environment, src: Union[str, "Entry"]) -> str:
+    """Returns the relative path to the given source file, relative to either
+    the source root or the build root
+
+    If the given source is underneath env["WHEEL_BUILD_DIR"], then the returned path is
+    relative to the build subdirectory. Otherwise, it is relative to the source root.
+
+    >>> get_rel_path(env, "foo/bar/baz.py")
+        "foo/bar/baz.py"
+    >>> get_rel_path(env, "build/bdir/foo/bar/baz.py")
+        "foo/bar/baz.py"
+
+    This is useful for discovering the original path to a file which may or may not be
+    currently under a build directory. It is primarily used for computing the path
+    for files about to be copied into the wheel. Its secondary use is to compute
+    a new build directory for a given file.
+
+    Another common use is to compute the path for files to copy from a build directory
+    back into the source tree (e.g. for inplace installs of shared objects)
+    """
+    build_dir = env["WHEEL_BUILD_DIR"]
+    src = env.Entry(src)
+    path_components = src.get_path_elements()
+    try:
+        index = path_components.index(build_dir)
+    except ValueError:
+        # Is relative to the root dir
+        return str(src)
+    else:
+        # Is relative to whichever build subdirectory it's in
+        return path_components[index + 1].rel_path(src)
+
+
+def get_build_path(
+    env: Environment, src: Union[str, "Entry"], build_dir: Union[str, "Dir"]
+) -> "File":
+    """Returns the path to use for files generated from some "src" file.
+
+    Paths returned are under a build directory named by the build_dir parameter.
+    If a directory is given for the build_dir, it must be a direct subdirectory within
+    env["WHEEL_BUILD_DIR"]
+
+    This method should be used by any builders which need to output intermediate files
+    from sources elsewhere (sorcues either in the source root directory or under one
+    of the build directories).
+
+    It correctly calculates the relative path so that paths relative to the source root
+    are preserved.
+
+    e.g.
+
+    >>> get_build_path(env, "src/foo/bar.pyx", "cython")
+        build/cython/src/foo/bar.c
+    >>> get_build_path(env, "build/cython/src/foo/bar.c", "lib.linux-x86_64")
+        build/lib.linux-x86_64/src/foo/bar.py
+    """
+    rel_path = get_rel_path(env, src)
+    if isinstance(build_dir, str):
+        build_dir = env["WHEEL_BUILD_DIR"].Dir(build_dir)
+    elif build_dir.get_path_elements()[-2] != env["WHEEL_BUILD_DIR"]:
+        raise ValueError(
+            f"Build directory {build_dir.get_abspath()} is not a direct subdirectory of "
+            f"{env['WHEEL_BUILD_DIR'].get_abspath()}"
+        )
+
+    full_path = build_dir.File(rel_path)
+    return full_path
+
+
+class PyProject(NamedTuple):
+    # Validate project name
+    name: str
+    # Validated version
+    version: str
+    # The distribution name component to be used in filenames
+    dist_filename: str
+
+    # Full deserialized project table, with name and version normalized
+    project_metadata: dict
+    # Tool table
+    tool_metadata: dict
+
+    # The filename that it was parsed from
+    file: str
+
+def parse_pyproject_toml(file: str):
+    toml = pytoml.load(open(file))
+    project_metadata = toml["project"]
+    try:
+        tool_metadata = toml["tool"]
+    except KeyError:
+        tool_metadata = {}
+
+    # Validate and normalize the name
+    name = project_metadata["name"]
+    if not DIST_NAME_RE.match(name):
+        raise UserError(
+            "Distribution name must consist of only ASCII letters, numbers, period, "
+            "underscore, and hyphen. It must start and end with a letter or number. "
+            f"Was {name!r}"
+        )
+    project_metadata["name"] = name
+
+    # The distribution name component to be used in filenames
+    dist_filename = packaging.utils.canonicalize_name(
+        name
+    ).replace("-", "_")
+
+    # Check if the version is valid and normalize it
+    version = str(packaging.version.parse(project_metadata["version"]))
+    project_metadata["version"] = version
+
+    return PyProject(
+        name=name,
+        version=version,
+        dist_filename=dist_filename,
+        project_metadata=project_metadata,
+        tool_metadata=tool_metadata,
+        file=file,
+    )
+
+def build_core_metadata(pyproject: PyProject) -> Tuple[str, List["File"]]:
+    """Builds the core metadata from the parsed pyproject.toml data
+
+    """
+    # Reference: https://packaging.python.org/en/latest/specifications/core-metadata/
+    sources: List[str] = [pyproject.file]
+    msg = Message()
+    metadata = pyproject.project_metadata
+
+    # Required metadata
+    msg["Metadata-Version"] = "2.3"
+    msg["Name"] = pyproject.name
+    msg["Version"] = pyproject.version
+
+    # Optional metadata
+    if "description" in metadata:
+        msg["Summary"] = metadata["description"]
+    if "requires-python" in metadata:
+        msg["Requires-Python"] = metadata["requires-python"]
+
+    # Readme field. May be a string referencing a file, or a table specifying a content
+    # type and either a file or text.
+    if "readme" in metadata:
+        readme = metadata["readme"]
+        if isinstance(readme, str):
+            filename = readme
+            contenttype = None
+            content = open(filename, "r", encoding="utf-8").read()
+        else:
+            assert isinstance(readme, dict)
+            if "file" and "text" in readme:
+                raise UserError(
+                    f'"file" and "text" keys are mutually exclusive in {pyproject.file} project.readme table'
+                )
+            if "file" in readme:
+                filename = readme["file"]
+                contenttype = readme.get("content-type")
+                encoding = readme.get("encoding", "utf-8")
+                content = open(filename, "r", encoding=encoding).read()
+            else:
+                filename = None
+                try:
+                    contenttype = readme["content-type"]
+                except KeyError as e:
+                    raise UserError(
+                        f"Missing content-type key in {pyproject.file} project.readme table"
+                    ) from e
+                content = readme["text"]
+        if contenttype is None:
+            assert filename
+            ext = os.path.splitext(filename)[1].lower()
+            try:
+                contenttype = {
+                    ".md": "text/markdown",
+                    ".rst": "text/x-rst",
+                    ".txt": "text/plain",
+                }[ext]
+            except KeyError as e:
+                raise UserError(
+                    f"Unknown readme file type {filename}. "
+                    f'Specify an explicit "content-type" key in the {pyproject.file} '
+                    f"project.readme table"
+                )
+        if filename:
+            sources.append(filename)
+        msg["Description-Content-Type"] = contenttype
+        msg.set_payload(content)
+
+    # License must be a table with either a "text" or a "file" key. Either the text
+    # string or the file's contents are added under the License core metadata field.
+    # If I'm interpreting the spec right, the entire license is stuffed into this single
+    # field. I wonder if the spec intended to e.g. include the entire GPL here?
+    # I think the intent was to only use this field if the license is something
+    # non-standard. Otherwise, use the appropriate classifier.
+    if "license" in metadata:
+        filename = metadata["license"].get("file")
+        content = metadata["license"].get("text")
+        if filename and content:
+            raise UserError(
+                f'"file" and "text" keys are mutually exclusive in {pyproject.file} project.license table'
+            )
+        if filename:
+            content = open(filename, "r", encoding="utf-8").read()
+            sources.append(filename)
+        msg["License"] = content
+
+    if "authors" in metadata:
+        _write_contacts(msg, "Author", "Author-Email", metadata["authors"])
+    if "maintainers" in metadata:
+        _write_contacts(
+            msg, "Maintainer", "Maintainer-Email", metadata["maintainers"]
+        )
+
+    if "keywords" in metadata:
+        msg["Keywords"] = ",".join(metadata["keywords"])
+
+    if "classifiers" in metadata:
+        for c in metadata["classifiers"]:
+            msg["Classifier"] = c
+
+    if "urls" in metadata:
+        for label, url in metadata["urls"].items():
+            msg["Project-URL"] = f"{label}, {url}"
+
+    if "dependencies" in metadata:
+        for dep in metadata["dependencies"]:
+            # Validate and normalize
+            dep = str(packaging.requirements.Requirement(dep))
+            msg["Requires-Dist"] = dep
+
+    if "optional-dependencies" in metadata:
+        for extra_name, dependencies in metadata["optional-dependencies"].items():
+            if not EXTRA_RE.match(extra_name):
+                raise UserError(f'Invalid extra name "{extra_name}"')
+            msg["Provides-Extra"] = extra_name
+            for dep in dependencies:
+                # Validate and normalize
+                dep = str(packaging.requirements.Requirement(dep))
+                msg["Requires-Dist"] = f"{dep}; extra = '{extra_name}'"
+
+    return str(msg), sources
+
+
 class Wheel:
     """Represents a wheel being built
 
@@ -45,8 +292,6 @@ class Wheel:
         self,
         env: Environment,
         tag: str,
-        build_dir="#build/",
-        pyproject="pyproject.toml",
         root_is_purelib: Optional[bool] = None,
         build_num: Optional[int] = None,
     ):
@@ -55,15 +300,14 @@ class Wheel:
         # Wheel configuration
         self.tag = tag
         self.tags = packaging.tags.parse_tag(tag)
-        self.build_dir: Dir = env.Dir(build_dir)
-        self.pyproject: File = env.File(pyproject)
+        self.build_dir: Dir = env.Dir(env["WHEEL_BUILD_DIR"])
         self.build_num = build_num
         if root_is_purelib is None:
             root_is_purelib = tag.endswith("-none-any")
         self.root_is_purelib: bool = root_is_purelib
 
         # Env configuration
-        self.wheel_output_dir = env.Dir(env.get("WHEEL_DIR") or "#dist")
+        self.wheel_output_dir = env.Dir(env.get("WHEEL_DIR"))
 
         platform_specifier = f"{sysconfig.get_platform()}-{sys.implementation.cache_tag}"
 
@@ -72,28 +316,13 @@ class Wheel:
         self.build_temp_dir: Dir = self.build_dir.Dir(f"temp.{platform_specifier}")
         self.build_lib_dir: Dir = self.build_dir.Dir(f"lib.{platform_specifier}")
 
-        # Read in metadata
-        toml = pytoml.load(open(self.pyproject.get_abspath()))
-        self.project_metadata = toml["project"]
-        try:
-            self.tool_metadata = toml["tool"]["enscons"]
-        except KeyError:
-            self.tool_metadata = {}
-
-        # Check the name is valid and normalize it
-        self.name = self.project_metadata["name"]
-        if not DIST_NAME_RE.match(self.name):
-            raise UserError(
-                "Distribution name must consist of only ASCII letters, numbers, period, "
-                "underscore, and hyphen. It must start and end with a letter or number. "
-                f"Was {self.name!r}"
-            )
-        self.normalized_filename = packaging.utils.canonicalize_name(
-            self.project_metadata["name"]
-        ).replace("-", "_")
-
-        # Check if the version is valid and normalize it
-        self.version = str(packaging.version.parse(self.project_metadata["version"]))
+        # Read in previously parsed metadata
+        self.pyproject: PyProject = env["PYPROJECT"]
+        self.project_metadata = self.pyproject.project_metadata
+        self.tool_metadata = self.pyproject.tool_metadata
+        self.name = self.pyproject.name
+        self.normalized_filename = self.pyproject.dist_filename
+        self.version = self.pyproject.version
 
         wheel_filename = make_wheelname(
             self.normalized_filename,
@@ -110,7 +339,7 @@ class Wheel:
         # Metadata and wheel metadata are built at construction time because we don't know
         # which sources to pass to SCons for dependency tracking until after the metadata
         # is read and parsed.
-        metadata, metadata_sources = self._get_metadata()
+        metadata, metadata_sources = env["CORE_METADATA"], env["CORE_METADATA_SOURCES"]
         metadata_targets.extend(
             env.Command(
                 self.wheel_data_dir.File("METADATA"),
@@ -131,7 +360,7 @@ class Wheel:
         metadata_targets.append(
             env.Command(
                 self.wheel_data_dir.File("entry_points.txt"),
-                self.pyproject,
+                self.pyproject.file,
                 self._build_entry_points,
             )
         )
@@ -140,7 +369,7 @@ class Wheel:
         self.target = self._add_zip_sources(metadata_targets)
 
         env.AddPostAction(self.target, env.Action(self._add_manifest))
-        env.Clean(self.target, self.build_dir)
+        env.Clean(self.target, self.wheel_build_dir)
 
     def _add_zip_sources(self, sources):
         return self._zip_env.Zip(
@@ -180,40 +409,23 @@ class Wheel:
 
         source: Entry
         for source in self.env.arg2nodes(sources, self.env.Entry):
-            path_componets = source.get_path_elements()
-            # Find which root directory this source is under
-            for d in self.wheel_build_dir.entries.values():
-                if d.isdir() and d in path_componets:
-                    break
-            else:
-                d = self.env.Dir(".")
-
-            root: Dir = d.Dir(root)
-
-            abs_source_path: str = source.get_abspath()
-            abs_root_path: str = root.get_abspath()
-            if not abs_source_path.startswith(abs_root_path):
-                raise UserError(
-                    f"Cannot add source at {abs_source_path}. "
-                    f"File is outside any known root directories"
-                )
-
-            # Now compute the relative path from root to source
-            rel_path = os.path.relpath(abs_source_path, abs_root_path)
-
-            target_dir = self.wheel_build_dir.Dir(os.path.dirname(rel_path))
-            targets = self.env.Install(target_dir, source)
+            rel_path = get_rel_path(self.env, source)
+            rel_path = os.path.relpath(rel_path, root)
+            install_path = self.wheel_build_dir.Entry(rel_path)
+            targets = self.env.InstallAs(install_path, source)
             self._add_zip_sources(targets)
 
-    def add_data(self, category, sources, root=None):
+    def add_data(self, category, sources, root="."):
         """Add sources to the data directory called "category", relative to the given root"""
         for source in self.env.arg2nodes(sources, self.env.Entry):
-            rel_path = os.path.relpath(source.get_path(), root or "")
-            whl_path = self.wheel_data_dir.Dir(category).Dir(rel_path)
-            targets = self.env.Install(whl_path, source)
+            rel_path = get_rel_path(self.env, source)
+            rel_path = os.path.relpath(rel_path, root)
+            install_path = self.wheel_data_dir.Dir(category).Entry(rel_path)
+            targets = self.env.InstallAs(install_path, source)
             self._add_zip_sources(targets)
 
     def _add_manifest(self, target, source, env):
+        # Called after the zip file has been written to the filesystem.
         archive = zipfile.ZipFile(
             target[0].get_path(), "a", compression=zipfile.ZIP_DEFLATED
         )
@@ -232,126 +444,7 @@ class Wheel:
             f.write(RECORD.encode("utf-8"))
         archive.close()
 
-    def _get_metadata(self) -> Tuple[str, Sequence[Node]]:
-        # Reference: https://packaging.python.org/en/latest/specifications/core-metadata/
-        sources: List[Node] = [self.pyproject]
-        msg = Message()
-        metadata = self.project_metadata
-
-        # Required metadata
-        msg["Metadata-Version"] = "2.3"
-        msg["Name"] = self.name
-        msg["Version"] = self.version
-
-        # Optional metadata
-        if "description" in metadata:
-            msg["Summary"] = metadata["description"]
-        if "requires-python" in metadata:
-            msg["Requires-Python"] = metadata["requires-python"]
-
-        # Readme field. May be a string referencing a file, or a table specifying a content
-        # type and either a file or text.
-        if "readme" in metadata:
-            readme = metadata["readme"]
-            if isinstance(readme, str):
-                filename = readme
-                contenttype = None
-                content = open(filename, "r", encoding="utf-8").read()
-            else:
-                assert isinstance(readme, dict)
-                if "file" and "text" in readme:
-                    raise UserError(
-                        f'"file" and "text" keys are mutually exclusive in {self.pyproject} project.readme table'
-                    )
-                if "file" in readme:
-                    filename = readme["file"]
-                    contenttype = readme.get("content-type")
-                    encoding = readme.get("encoding", "utf-8")
-                    content = open(filename, "r", encoding=encoding).read()
-                else:
-                    filename = None
-                    try:
-                        contenttype = readme["content-type"]
-                    except KeyError as e:
-                        raise UserError(
-                            f"Missing content-type key in {self.pyproject} project.readme table"
-                        ) from e
-                    content = readme["text"]
-            if contenttype is None:
-                assert filename
-                ext = os.path.splitext(filename)[1].lower()
-                try:
-                    contenttype = {
-                        ".md": "text/markdown",
-                        ".rst": "text/x-rst",
-                        ".txt": "text/plain",
-                    }[ext]
-                except KeyError as e:
-                    raise UserError(
-                        f"Unknown readme file type {filename}. "
-                        f'Specify an explicit "content-type" key in the {self.pyproject} '
-                        f"project.readme table"
-                    )
-            if filename:
-                sources.append(self.env.File(filename))
-            msg["Description-Content-Type"] = contenttype
-            msg.set_payload(content)
-
-        # License must be a table with either a "text" or a "file" key. Either the text
-        # string or the file's contents are added under the License core metadata field.
-        # If I'm interpreting the spec right, the entire license is stuffed into this single
-        # field. I wonder if the spec intended to e.g. include the entire GPL here?
-        # I think the intent was to only use this field if the license is something
-        # non-standard. Otherwise, use the appropriate classifier.
-        if "license" in metadata:
-            filename = metadata["license"].get("file")
-            content = metadata["license"].get("text")
-            if filename and content:
-                raise UserError(
-                    f'"file" and "text" keys are mutually exclusive in {self.pyproject} project.license table'
-                )
-            if filename:
-                content = open(filename, "r", encoding="utf-8").read()
-                sources.append(self.env.File(filename))
-            msg["License"] = content
-
-        if "authors" in metadata:
-            _write_contacts(msg, "Author", "Author-Email", metadata["authors"])
-        if "maintainers" in metadata:
-            _write_contacts(
-                msg, "Maintainer", "Maintainer-Email", metadata["maintainers"]
-            )
-
-        if "keywords" in metadata:
-            msg["Keywords"] = ",".join(metadata["keywords"])
-
-        if "classifiers" in metadata:
-            for c in metadata["classifiers"]:
-                msg["Classifier"] = c
-
-        if "urls" in metadata:
-            for label, url in metadata["urls"].items():
-                msg["Project-URL"] = f"{label}, {url}"
-
-        if "dependencies" in metadata:
-            for dep in metadata["dependencies"]:
-                # Validate and normalize
-                dep = str(packaging.requirements.Requirement(dep))
-                msg["Requires-Dist"] = dep
-
-        if "optional-dependencies" in metadata:
-            for extra_name, dependencies in metadata["optional-dependencies"].items():
-                if not EXTRA_RE.match(extra_name):
-                    raise UserError(f'Invalid extra name "{extra_name}"')
-                msg["Provides-Extra"] = extra_name
-                for dep in dependencies:
-                    # Validate and normalize
-                    dep = str(packaging.requirements.Requirement(dep))
-                    msg["Requires-Dist"] = f"{dep}; extra = '{extra_name}'"
-
-        return str(msg), sources
-
-    def _get_wheel_metadata(self) -> Tuple[str, Sequence[Node]]:
+    def _get_wheel_metadata(self) -> Tuple[str, Sequence[Union[str, "Node"]]]:
         msg = Message()
         msg["Wheel-Version"] = "1.0"
         msg["Generator"] = "enscons"
@@ -361,7 +454,11 @@ class Wheel:
         for tag in self.tags:
             msg["Tag"] = str(tag)
 
-        return str(msg), [self.pyproject]
+        sources = [self.pyproject.file]
+        if self.build_num is not None:
+            sources.append(self.env.Value(f"Build: {self.build_num}"))
+
+        return str(msg), sources
 
     def _build_entry_points(self, target, source, env):
         metadata = self.project_metadata
@@ -377,9 +474,11 @@ class Wheel:
         if "entry-points" in metadata:
             for group, items in metadata["entry-points"].items():
                 if group in ("scripts", "gui-scripts"):
-                    raise UserError(f"Invalid {self.pyproject} table "
-                                    f"project.entry-points.{group} Use project.{group} "
-                                    f"instead")
+                    raise UserError(
+                        f"Invalid {self.pyproject} table "
+                        f"project.entry-points.{group} Use project.{group} "
+                        f"instead"
+                    )
                 groups[group] = items
 
         ini = ConfigParser()
@@ -392,9 +491,37 @@ class Wheel:
             ini.write(f)
 
 
-def SDist(env: Environment, sources):
+def SDist(env: Environment, sources) -> List["Entry"]:
     sources = env.arg2nodes(sources, env.Entry)
-    # TODO
+    build_dir = env["WHEEL_BUILD_DIR"].Dir("sdist")
+    # Source dists must contain a pyproject.toml file
+    if env.File("pyproject.toml") not in sources:
+        raise ValueError("Source dists must contain a pyproject.toml")
+
+    targets = [
+        env.Command(
+            get_build_path(env, "PKG-INFO", build_dir),
+            env["CORE_METADATA_SOURCES"],
+            _generate_str_writer_action(env["CORE_METADATA"]),
+        )
+    ]
+    for source in sources:
+        targets.extend(env.InstallAs(
+            get_build_path(env, source, build_dir),
+            source,
+        ))
+
+    pyproject: PyProject = env["PYPROJECT"]
+    dirname = f"{pyproject.dist_filename}-{pyproject.version}"
+    filename = f"{dirname}.tar.gz"
+    target = env.PyTar(
+        env["SDIST_DIR"].File(filename),
+        targets,
+        TARROOT=build_dir,
+        TARPREFIX=dirname,
+    )
+    env.Clean(target, build_dir)
+    return target
 
 
 def Editable(env, src_root="."):
@@ -447,7 +574,7 @@ def _write_contacts(
 
 def _generate_str_writer_action(
     s: str,
-) -> Callable[[Sequence[Node], Sequence[Node], Environment], None]:
+) -> Callable[[Sequence["Node"], Sequence["Node"], Environment], None]:
     """Returns an SCons action function which writes the given string to the target"""
 
     def action(target, source, env):
@@ -460,6 +587,23 @@ def _generate_str_writer_action(
 
 
 def generate(env: Environment, **kwargs):
+    pytar.generate(env)
+    if "WHEEL_BUILD_DIR" not in env:
+        env["WHEEL_BUILD_DIR"] = env.Dir("#build/")
+
+    if "WHEEL_DIR" not in env:
+        env["WHEEL_DIR"] = env.Dir("#dist/")
+
+    if "SDIST_DIR" not in env:
+        env["SDIST_DIR"] = env.Dir("#dist/")
+
+    pyproject_file = env.get("PYPROJECT_FILE", "pyproject.toml")
+    env["PYPROJECT"] = parse_pyproject_toml(pyproject_file)
+    env["CORE_METADATA"], env["CORE_METADATA_SOURCES"] = build_core_metadata(env["PYPROJECT"])
+
+    env.AddMethod(get_rel_path)
+    env.AddMethod(get_build_path)
+
     env.AddMethod(Wheel)
     env.AddMethod(SDist)
     env.AddMethod(Editable)
