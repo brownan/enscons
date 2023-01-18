@@ -5,6 +5,7 @@ import re
 import sys
 import sysconfig
 import zipfile
+from configparser import ConfigParser
 from email.message import Message
 from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
@@ -26,13 +27,12 @@ def urlsafe_b64encode(data):
     return base64.urlsafe_b64encode(data).rstrip(b"=")
 
 
-# Distribution names must match this
 DIST_NAME_RE = re.compile(
     "^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$", flags=re.IGNORECASE
 )
-
-# Extra names must match this
 EXTRA_RE = re.compile("^([a-z0-9]|[a-z0-9]([a-z0-9-](?!--))*[a-z0-9])$")
+EPOINT_GROUP_RE = re.compile(r"^\w+(\.\w+)*$")
+EPOINT_NAME_RE = re.compile(r"[\w.-]+")
 
 
 class Wheel:
@@ -107,7 +107,10 @@ class Wheel:
 
         metadata_targets = []
 
-        metadata, metadata_sources = self._build_metadata()
+        # Metadata and wheel metadata are built at construction time because we don't know
+        # which sources to pass to SCons for dependency tracking until after the metadata
+        # is read and parsed.
+        metadata, metadata_sources = self._get_metadata()
         metadata_targets.extend(
             env.Command(
                 self.wheel_data_dir.File("METADATA"),
@@ -116,12 +119,20 @@ class Wheel:
             )
         )
 
-        wheel_metadata, wheel_metadata_sources = self._build_wheel_metadata()
+        wheel_metadata, wheel_metadata_sources = self._get_wheel_metadata()
         metadata_targets.extend(
             env.Command(
                 self.wheel_data_dir.File("WHEEL"),
                 wheel_metadata_sources,
                 _generate_str_writer_action(wheel_metadata),
+            )
+        )
+
+        metadata_targets.append(
+            env.Command(
+                self.wheel_data_dir.File("entry_points.txt"),
+                self.pyproject,
+                self._build_entry_points,
             )
         )
 
@@ -221,7 +232,7 @@ class Wheel:
             f.write(RECORD.encode("utf-8"))
         archive.close()
 
-    def _build_metadata(self) -> Tuple[str, Sequence[Node]]:
+    def _get_metadata(self) -> Tuple[str, Sequence[Node]]:
         # Reference: https://packaging.python.org/en/latest/specifications/core-metadata/
         sources: List[Node] = [self.pyproject]
         msg = Message()
@@ -340,7 +351,7 @@ class Wheel:
 
         return str(msg), sources
 
-    def _build_wheel_metadata(self) -> Tuple[str, Sequence[Node]]:
+    def _get_wheel_metadata(self) -> Tuple[str, Sequence[Node]]:
         msg = Message()
         msg["Wheel-Version"] = "1.0"
         msg["Generator"] = "enscons"
@@ -351,6 +362,34 @@ class Wheel:
             msg["Tag"] = str(tag)
 
         return str(msg), [self.pyproject]
+
+    def _build_entry_points(self, target, source, env):
+        metadata = self.project_metadata
+
+        groups = {}
+
+        if "scripts" in metadata:
+            groups["console_scripts"] = metadata["scripts"]
+
+        if "gui-scripts" in metadata:
+            groups["gui_scripts"] = metadata["gui-scripts"]
+
+        if "entry-points" in metadata:
+            for group, items in metadata["entry-points"].items():
+                if group in ("scripts", "gui-scripts"):
+                    raise UserError(f"Invalid {self.pyproject} table "
+                                    f"project.entry-points.{group} Use project.{group} "
+                                    f"instead")
+                groups[group] = items
+
+        ini = ConfigParser()
+        for group, items in groups.items():
+            ini.add_section(group)
+            for key, val in items.items():
+                ini[group][key] = val
+
+        with open(target[0].get_abspath(), "w", encoding="utf-8") as f:
+            ini.write(f)
 
 
 def SDist(env: Environment, sources):
