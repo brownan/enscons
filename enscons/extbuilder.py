@@ -22,7 +22,6 @@ def configure_compiler_env(env):
         cflags,
         ccshared,
         ldshared,
-        libdir,
         ext_suffix,
     ) = sysconfig.get_config_vars(
         "CC",
@@ -30,13 +29,14 @@ def configure_compiler_env(env):
         "CFLAGS",
         "CCSHARED",
         "LDSHARED",
-        "LIBDIR",
         "EXT_SUFFIX",
     )
 
+    paths = sysconfig.get_paths()
+
     include_dirs = {
-        sysconfig.get_path("include"),
-        sysconfig.get_path("platinclude"),
+        paths["include"],
+        paths["platinclude"],
     }
 
     # Include Virtualenv
@@ -45,8 +45,8 @@ def configure_compiler_env(env):
 
     # Platform library directories
     library_dirs = {
-        sysconfig.get_path("stdlib"),
-        sysconfig.get_path("platstdlib"),
+        paths["stdlib"],
+        paths["platstdlib"],
     }
 
     # Set compilers and flags
