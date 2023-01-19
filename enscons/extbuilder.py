@@ -1,4 +1,3 @@
-import distutils.sysconfig
 import shlex
 import sysconfig
 import os.path
@@ -14,9 +13,9 @@ if TYPE_CHECKING:
     from SCons.Node.FS import Dir, Entry, File
     from SCons.Node import Node
 
+
 def configure_compiler_env(env):
-    # Get various compiler options we need to build a python extension module
-    # Mostly ported from distutils.sysconfig
+    # Get compiler and compiler options we need to build a python extension module
     (
         cc,
         cxx,
@@ -25,7 +24,7 @@ def configure_compiler_env(env):
         ldshared,
         libdir,
         ext_suffix,
-    ) = distutils.sysconfig.get_config_vars(
+    ) = sysconfig.get_config_vars(
         "CC",
         "CXX",
         "CFLAGS",
@@ -35,22 +34,20 @@ def configure_compiler_env(env):
         "EXT_SUFFIX",
     )
 
-    include_dirs = []
+    include_dirs = {
+        sysconfig.get_path("include"),
+        sysconfig.get_path("platinclude"),
+    }
 
-    # Include Virtualenvs
+    # Include Virtualenv
     if sys.exec_prefix != sys.base_exec_prefix:
-        include_dirs.append(os.path.join(sys.exec_prefix, "include"))
-
-    # Platform include directories
-    py_include = distutils.sysconfig.get_python_inc()
-    plat_include = distutils.sysconfig.get_python_inc(plat_specific=1)
-    include_dirs.extend(py_include.split(os.path.pathsep))
-    if plat_include != py_include:
-        include_dirs.extend(plat_include.split(os.path.pathsep))
+        include_dirs.add(os.path.join(sys.exec_prefix, "include"))
 
     # Platform library directories
-    library_dirs = []
-    library_dirs.append(libdir)
+    library_dirs = {
+        sysconfig.get_path("stdlib"),
+        sysconfig.get_path("platstdlib"),
+    }
 
     # Set compilers and flags
     env["CC"] = cc
@@ -58,10 +55,12 @@ def configure_compiler_env(env):
     env["SHLINK"] = ldshared
     env.Prepend(
         CFLAGS=shlex.split(cflags),
-        CPPPATH=include_dirs,
-        LIBPATH=library_dirs,
+        CPPPATH=list(include_dirs),
+        LIBPATH=list(library_dirs),
     )
-    env.Replace(SHCFLAGS=shlex.split(ccshared) + env["CFLAGS"])
+    env.Replace(
+        SHCFLAGS=shlex.split(ccshared) + env["CFLAGS"],
+    )
 
     # Naming convention for extension module shared objects
     env["SHLIBSUFFIX"] = ext_suffix
@@ -90,10 +89,10 @@ def ExtModule(
 
     objects = []
     for node in source_files:
-        obj = Path(get_build_path(env, node, build_dir).get_path()).with_suffix("")
+        obj = get_build_path(env, node, build_dir, "")
         objects.append(env.SharedObject(target=str(obj), source=node))
 
-    so = Path(get_build_path(env, modsource, lib_dir).get_path()).with_suffix("")
+    so = get_build_path(env, modsource, lib_dir, "")
     library = env.SharedLibrary(target=str(so), source=objects)
 
     return library
@@ -109,6 +108,7 @@ def InstallExtensionInplace(
         relpath = get_rel_path(env, module)
         targets.extend(env.InstallAs(relpath, module))
     return targets
+
 
 def generate(env, **kwargs):
     env.AddMethod(ExtModule)

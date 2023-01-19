@@ -49,8 +49,8 @@ EPOINT_NAME_RE = re.compile(r"[\w.-]+")
 
 
 def get_rel_path(env: Environment, src: Union[str, "Entry"]) -> str:
-    """Returns the relative path to the given source file, relative to either
-    the source root or the build root
+    """Returns the path to the given source file relative to either the source root or
+    a build directory.
 
     If the given source is underneath env["WHEEL_BUILD_DIR"], then the returned path is
     relative to the build subdirectory. Otherwise, it is relative to the source root.
@@ -63,10 +63,10 @@ def get_rel_path(env: Environment, src: Union[str, "Entry"]) -> str:
     This is useful for discovering the original path to a file which may or may not be
     currently under a build directory. It is primarily used for computing the path
     for files about to be copied into the wheel. Its secondary use is to compute
-    a new build directory for a given file.
+    a new build directory for a given file (but see get_build_path()).
 
-    Another common use is to compute the path for files to copy from a build directory
-    back into the source tree (e.g. for inplace installs of shared objects)
+    Another common use is to compute a path for derived files in some build directory
+    to copy back into the source tree (e.g. for inplace installs of shared objects)
     """
     build_dir = env["WHEEL_BUILD_DIR"]
     src = env.Entry(src)
@@ -82,27 +82,34 @@ def get_rel_path(env: Environment, src: Union[str, "Entry"]) -> str:
 
 
 def get_build_path(
-    env: Environment, src: Union[str, "Entry"], build_dir: Union[str, "Dir"]
-) -> "File":
+    env: Environment,
+    src: Union[str, "Entry"],
+    build_dir: Union[str, "Dir"],
+    new_ext: Optional[str] = None,
+) -> str:
     """Returns the path to use for files generated from some "src" file.
 
-    Paths returned are under a build directory named by the build_dir parameter.
-    If a directory is given for the build_dir, it must be a direct subdirectory within
-    env["WHEEL_BUILD_DIR"]
+    For a given "src" path, computes the same path rooted at the given build directory.
+    build_dir can be either a string, which is then taken as the name of a subdirectory
+    under env["WHEEL_BUILD_DIR"]. build_dir can also be a "Dir" object, in which case
+    it must refer to a directory which is a direct subdirectory of env["WHEEL_BUILD_DIR"]
 
-    This method should be used by any builders which need to output intermediate files
-    from sources elsewhere (sorcues either in the source root directory or under one
-    of the build directories).
-
-    It correctly calculates the relative path so that paths relative to the source root
-    are preserved.
+    This method should be used by any builders which need to output derived files
+    from some source. Using this method ensures that builders compute the correct relative
+    path regardless of whether the source is in the source tree or is itself some
+    derivative file under env["WHEEL_BUILD_DIR"]
 
     e.g.
 
-    >>> get_build_path(env, "src/foo/bar.pyx", "cython")
+    >>> get_build_path(env, "src/foo/bar.pyx", "cython", ".c")
         build/cython/src/foo/bar.c
-    >>> get_build_path(env, "build/cython/src/foo/bar.c", "lib.linux-x86_64")
-        build/lib.linux-x86_64/src/foo/bar.py
+    >>> get_build_path(env, "build/cython/src/foo/bar.c", "lib.linux-x86_64", "")
+        build/lib.linux-x86_64/src/foo/bar
+
+    The new_ext parameter can be used to change the file extension.
+    An empty string will strip the extension off entirely. This is useful when passing a
+    path into a builder which adds the extension automatically.
+
     """
     rel_path = get_rel_path(env, src)
     if isinstance(build_dir, str):
@@ -113,7 +120,11 @@ def get_build_path(
             f"{env['WHEEL_BUILD_DIR'].get_abspath()}"
         )
 
-    full_path = build_dir.File(rel_path)
+    full_path = build_dir.File(rel_path).get_relpath()
+    if new_ext is not None:
+        if not new_ext.startswith(".") and new_ext != "":
+            new_ext = "." + new_ext
+        full_path = os.path.splitext(full_path)[0] + new_ext
     return full_path
 
 
@@ -201,7 +212,7 @@ def build_core_metadata(pyproject: PyProject) -> Tuple[str, List[str]]:
             if "file" and "text" in readme:
                 raise UserError(
                     f'"file" and "text" keys are mutually exclusive in {pyproject.file}'
-                    f' project.readme table'
+                    f" project.readme table"
                 )
             if "file" in readme:
                 filename = readme["file"]
